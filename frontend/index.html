@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Data Entry Agent</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h2>AI Data Entry Agent</h2>
+
+<form id="uploadForm">
+    <input type="file" id="files" multiple>
+
+    <textarea id="prompt"
+        placeholder="Extract invoice number, total amount, date">
+    </textarea>
+
+    <select id="format">
+        <option value="csv">CSV</option>
+        <option value="excel">Excel</option>
+        <option value="json">JSON</option>
+    </select>
+
+    <button type="submit">Run Extraction</button>
+</form>
+
+<div id="status"></div>
+<div id="download"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
