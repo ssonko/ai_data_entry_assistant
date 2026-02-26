@@ -9,6 +9,10 @@ from .config import OUTPUT_DIR
 
 app = FastAPI(title="AI Data Entry Agent")
 
+@app.get("/")
+def health():
+    return {"status": "AI Data Entry Agent running"}
+    
 @app.post("/process")
 async def process_files(
     files: List[UploadFile] = File(...),
