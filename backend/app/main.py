@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from typing import List
+from pathlib import Path
 import os
 
 from .ai_extractor import extract_data
@@ -9,17 +11,34 @@ from .config import OUTPUT_DIR
 
 app = FastAPI(title="AI Data Entry Agent")
 
+# ───────────────────────────────
+# PATH SETUP
+# ───────────────────────────────
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+# Serve static files (CSS + JS)
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+# ───────────────────────────────
+# FRONTEND ROUTE
+# ───────────────────────────────
+
 @app.get("/")
-def health():
-    return {"status": "AI Data Entry Agent running"}
-    
+def serve_frontend():
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+# ───────────────────────────────
+# PROCESS FILES
+# ───────────────────────────────
+
 @app.post("/process")
 async def process_files(
     files: List[UploadFile] = File(...),
     prompt: str = Form(...),
     output_format: str = Form("csv")
 ):
-
     all_results = []
 
     for file in files:
@@ -43,9 +62,12 @@ async def process_files(
         "download_url": f"/download/{filename}"
     }
 
+# ───────────────────────────────
+# DOWNLOAD FILE
+# ───────────────────────────────
+
 @app.get("/download/{filename}")
 def download_file(filename: str):
-
     file_path = os.path.join(OUTPUT_DIR, filename)
 
     if not os.path.exists(file_path):
