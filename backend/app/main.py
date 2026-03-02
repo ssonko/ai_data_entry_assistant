@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from typing import List
 from pathlib import Path
 import os
+import asyncio
 
 from .ai_extractor import extract_data
 from .file_service import create_output_file
@@ -30,6 +31,25 @@ def serve_frontend():
     return FileResponse(FRONTEND_DIR / "index.html")
 
 # ───────────────────────────────
+# OPTIONAL: HEALTH CHECK
+# ───────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "AI Data Entry Agent running"}
+
+# ───────────────────────────────
+# CONCURRENCY CONTROL
+# ───────────────────────────────
+
+# Limit concurrent OpenAI calls (prevents rate-limit crashes)
+semaphore = asyncio.Semaphore(5)
+
+async def limited_extract(text: str, prompt: str):
+    async with semaphore:
+        return await extract_data(text, prompt)
+
+# ───────────────────────────────
 # PROCESS FILES
 # ───────────────────────────────
 
@@ -39,13 +59,23 @@ async def process_files(
     prompt: str = Form(...),
     output_format: str = Form("csv")
 ):
-    all_results = []
+    tasks = []
 
+    # Read files and prepare async tasks
     for file in files:
         content = await file.read()
         text = content.decode(errors="ignore")
+        tasks.append(limited_extract(text, prompt))
 
-        result = await extract_data(text, prompt)
+    # Run AI calls concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_results = []
+
+    for result in results:
+        if isinstance(result, Exception):
+            print("File processing error:", result)
+            continue
 
         if result:
             if isinstance(result, dict):

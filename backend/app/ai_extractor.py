@@ -1,33 +1,50 @@
 import json
-from openai import OpenAI
-from .config import OPENAI_API_KEY
+import os
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+load_dotenv()
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 async def extract_data(file_content: str, user_prompt: str):
 
-    response = client.chat.completions.create(
-        model="gpt-5.nano",
-        messages=[
-            {"role": "system", "content": "Return structured JSON only."},
-            {
-                "role": "user",
-                "content": f"""
-                Extract the following:
-                {user_prompt}
-
-                Return valid JSON only.
-                Document:
-                {file_content}
-                """
-            }
-        ],
-        temperature=0
-    )
-
-    content = response.choices[0].message.content
-
     try:
+        response = await client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You extract and summarize key details from PDF text.
+
+Return structured JSON.
+
+Rules:
+- Return valid JSON only.
+- No markdown.
+- No explanations outside JSON.
+- If multiple records exist, return a JSON array.
+- If a field is missing, return null.
+- Do not invent data.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": f"""
+{user_prompt}
+
+DOCUMENT:
+{file_content}
+"""
+                }
+            ]
+        )
+
+        content = response.choices[0].message.content.strip()
+
         return json.loads(content)
-    except:
+
+    except Exception as e:
+        print("Extraction error:", e)
         return None
