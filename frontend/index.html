@@ -1,32 +1,640 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>AI Data Entry Agent</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
 
 <h2>AI Data Entry Agent</h2>
 
-<form id="uploadForm">
-    <input type="file" id="files" multiple>
+<div class="layout">
 
-    <textarea id="prompt"
-        placeholder="Extract invoice number, total amount, date">
-    </textarea>
+  <!-- ── LEFT: Controls ──────────────────────────────── -->
+  <div class="form-panel">
+    <form id="uploadForm">
+        <label>Files</label>
+        <input type="file" id="files" name="files" multiple required accept=".pdf,.txt">
 
-    <select id="format">
-        <option value="csv">CSV</option>
-        <option value="excel">Excel</option>
-        <option value="json">JSON</option>
-    </select>
+        <label>Extraction prompt</label>
+        <textarea
+            id="prompt"
+            name="prompt"
+            placeholder="Extract invoice number, total amount, date"
+            required>
+        </textarea>
 
-    <button type="submit">Run Extraction</button>
-</form>
+        <label>Output format</label>
+        <select id="format" name="format">
+            <option value="csv">CSV</option>
+            <option value="excel">Excel</option>
+            <option value="json">JSON</option>
+        </select>
 
-<div id="status"></div>
-<div id="download"></div>
+        <label>Output mode</label>
+        <div class="radio-group">
+            <label><input type="radio" name="outMode" value="single" checked> Single file (all PDFs)</label>
+            <label><input type="radio" name="outMode" value="multiple"> One file per PDF</label>
+        </div>
 
-<script src="script.js"></script>
+        <div class="button-row">
+            <button type="button" id="btnNext" disabled>Next PDF</button>
+            <button type="button" id="btnAll" disabled>Extract All</button>
+        </div>
+
+        <div id="queue-status"></div>
+    </form>
+
+    <div id="download"></div>
+  </div>
+
+  <div class="resize-handle"></div>
+
+  <!-- ── MIDDLE: PDF Viewer ───────────────────────────── -->
+  <div class="pdf-panel">
+    <div class="pdf-toolbar">
+        <span id="pdf-filename" class="pdf-name">No file selected</span>
+        <div class="pdf-page-controls">
+            <button id="pdf-prev" disabled>&#9664;</button>
+            <span id="pdf-page-num">&#8212; / &#8212;</span>
+            <button id="pdf-next" disabled>&#9654;</button>
+        </div>
+    </div>
+
+    <div class="pdf-viewport" id="pdf-viewport">
+        <div class="pdf-page-wrapper" id="pdf-page-wrapper">
+            <canvas id="pdf-canvas"></canvas>
+            <div id="pdf-text-layer" class="textLayer"></div>
+        </div>
+        <div id="pdf-placeholder" class="pdf-placeholder">
+            <span>Upload PDFs to preview them here</span>
+        </div>
+    </div>
+  </div>
+
+  <div class="resize-handle"></div>
+
+  <!-- ── RIGHT: JSON Results ──────────────────────────── -->
+  <div class="output-panel">
+    <div class="output-header">
+        <span>Extraction Results</span>
+        <div class="font-size-ctrl">
+            <button id="btnFontDec" title="Decrease font size">A−</button>
+            <span id="fontSizeLabel">12px</span>
+            <button id="btnFontInc" title="Increase font size">A+</button>
+        </div>
+        <button id="btnClear" class="clear-btn">Clear</button>
+    </div>
+
+    <!-- Single-record navigator -->
+    <div class="result-nav">
+        <button id="btnResultPrev" disabled>&#9664;</button>
+        <span id="result-nav-info">No results yet</span>
+        <button id="btnResultNext" disabled>&#9654;</button>
+    </div>
+
+    <!-- Single result view -->
+    <div id="current-result" class="current-result"></div>
+
+    <div class="resize-handle-h" id="output-vresize"></div>
+  </div>
+
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+// ── State ────────────────────────────────────────────────────
+let fileQueue        = [];
+let currentIndex     = 0;
+let isRunning        = false;
+let currentExtractionData = null;
+
+// Stored results: [{filename, file, state:'loading'|'ok'|'error', data, error}]
+let extractedResults = [];
+let viewingIndex     = -1;
+
+let pdfDoc         = null;
+let pdfPageNum     = 1;
+let pdfPageCount   = 0;
+let pdfRendering   = false;
+let pdfPagePending = null;
+
+// ── DOM refs ─────────────────────────────────────────────────
+const filesInput      = document.getElementById("files");
+const promptInput     = document.getElementById("prompt");
+const formatSelect    = document.getElementById("format");
+const btnNext         = document.getElementById("btnNext");
+const btnAll          = document.getElementById("btnAll");
+const btnClear        = document.getElementById("btnClear");
+const queueStatus     = document.getElementById("queue-status");
+const downloadDiv     = document.getElementById("download");
+const currentResultEl = document.getElementById("current-result");
+const resultNavInfo   = document.getElementById("result-nav-info");
+const btnResultPrev   = document.getElementById("btnResultPrev");
+const btnResultNext   = document.getElementById("btnResultNext");
+
+const pdfCanvas       = document.getElementById("pdf-canvas");
+const textLayerDiv    = document.getElementById("pdf-text-layer");
+const pdfWrapper      = document.getElementById("pdf-page-wrapper");
+const pdfPlaceholder  = document.getElementById("pdf-placeholder");
+const pdfFilenameEl   = document.getElementById("pdf-filename");
+const pdfPageNumEl    = document.getElementById("pdf-page-num");
+const btnPdfPrev      = document.getElementById("pdf-prev");
+const btnPdfNext      = document.getElementById("pdf-next");
+
+// ── File selection ───────────────────────────────────────────
+filesInput.addEventListener("change", () => {
+    fileQueue    = Array.from(filesInput.files);
+    currentIndex = 0;
+    currentExtractionData = null;
+    downloadDiv.innerHTML = "";
+    updateQueueStatus();
+    btnNext.disabled = fileQueue.length === 0;
+    btnAll.disabled  = fileQueue.length === 0;
+
+    if (fileQueue.length > 0) loadPdfFile(fileQueue[0]);
+    else clearPdfViewer();
+});
+
+// ── Result navigation (arrows in results pane) ───────────────
+btnResultPrev.addEventListener("click", () => {
+    if (viewingIndex > 0) showResult(viewingIndex - 1);
+});
+btnResultNext.addEventListener("click", () => {
+    if (viewingIndex < extractedResults.length - 1) showResult(viewingIndex + 1);
+});
+
+// ── PDF page navigation ──────────────────────────────────────
+btnPdfPrev.addEventListener("click", () => {
+    if (pdfPageNum > 1) { pdfPageNum--; queueRenderPage(pdfPageNum); }
+});
+btnPdfNext.addEventListener("click", () => {
+    if (pdfPageNum < pdfPageCount) { pdfPageNum++; queueRenderPage(pdfPageNum); }
+});
+
+// ── Next PDF ─────────────────────────────────────────────────
+btnNext.addEventListener("click", async () => {
+    if (currentIndex >= fileQueue.length) return;
+
+    const file = fileQueue[currentIndex];
+    await extractOne(file);
+    currentIndex++;
+    updateQueueStatus();
+
+    if (currentIndex < fileQueue.length) {
+        btnNext.disabled = false;
+        btnAll.disabled  = false;
+    } else {
+        setQueueStatus("All files processed.", "done");
+        offerDownload();
+    }
+});
+
+// ── Extract All ──────────────────────────────────────────────
+btnAll.addEventListener("click", async () => {
+    if (isRunning) return;
+    isRunning = true;
+    btnNext.disabled = true;
+    btnAll.disabled  = true;
+
+    while (currentIndex < fileQueue.length) {
+        await extractOne(fileQueue[currentIndex]);
+        currentIndex++;
+        updateQueueStatus();
+    }
+
+    setQueueStatus("All files processed.", "done");
+    offerDownload();
+    isRunning = false;
+});
+
+// ── Clear ────────────────────────────────────────────────────
+btnClear.addEventListener("click", () => {
+    extractedResults      = [];
+    viewingIndex          = -1;
+    currentExtractionData = null;
+    currentResultEl.innerHTML = "";
+    updateResultNav();
+    downloadDiv.innerHTML  = "";
+    fileQueue              = [];
+    currentIndex           = 0;
+    filesInput.value       = "";
+    btnNext.disabled       = true;
+    btnAll.disabled        = true;
+    queueStatus.textContent = "";
+    clearPdfViewer();
+});
+
+// ── Show result at index (syncs PDF viewer too) ──────────────
+function showResult(index) {
+    if (index < 0 || index >= extractedResults.length) return;
+    viewingIndex = index;
+    const r = extractedResults[index];
+
+    currentResultEl.innerHTML = buildCardHTML(r.filename, r.data, r.state, r.error);
+    attachCopy(currentResultEl);
+
+    if (r.state === "ok" && r.data) {
+        currentExtractionData = r.data;
+        // Highlights applied after PDF renders (renderPage calls highlightJsonValues)
+    } else {
+        currentExtractionData = null;
+        textLayerDiv.querySelectorAll("span").forEach(s => s.classList.remove("hl"));
+    }
+
+    // Sync PDF viewer to this file
+    if (r.file) loadPdfFile(r.file);
+
+    updateResultNav();
+}
+
+function updateResultNav() {
+    const total = extractedResults.length;
+    if (total === 0) {
+        resultNavInfo.textContent = "No results yet";
+        btnResultPrev.disabled = btnResultNext.disabled = true;
+    } else {
+        resultNavInfo.textContent = `${viewingIndex + 1} / ${total}`;
+        btnResultPrev.disabled = viewingIndex <= 0;
+        btnResultNext.disabled = viewingIndex >= total - 1;
+    }
+}
+
+// ── Extract single file ──────────────────────────────────────
+async function extractOne(file) {
+    btnNext.disabled = true;
+    btnAll.disabled  = true;
+    setQueueStatus(`Processing: ${file.name} …`, "active");
+
+    // Push a loading placeholder and show it
+    const idx = extractedResults.length;
+    extractedResults.push({ filename: file.name, file, state: "loading", data: null, error: null });
+    showResult(idx);
+
+    const formData = new FormData();
+    formData.append("file",   file);
+    formData.append("prompt", promptInput.value);
+
+    try {
+        const resp = await fetch("/extract", { method: "POST", body: formData });
+        const json = await resp.json();
+
+        if (json.error) {
+            extractedResults[idx] = { filename: file.name, file, state: "error", data: null, error: json.error };
+        } else {
+            extractedResults[idx] = { filename: file.name, file, state: "ok", data: json.data, error: null };
+        }
+    } catch (err) {
+        extractedResults[idx] = { filename: file.name, file, state: "error", data: null, error: err.message };
+    }
+
+    // Re-render the pane if still on this result
+    if (viewingIndex === idx) showResult(idx);
+    updateResultNav();
+}
+
+// ── Card HTML builder ─────────────────────────────────────────
+function buildCardHTML(filename, data, state, errMsg) {
+    const badge = state === "loading" ? '<span class="badge loading">Processing…</span>'
+                : state === "error"   ? '<span class="badge error">Error</span>'
+                :                      '<span class="badge ok">Done</span>';
+    const body  = state === "loading"
+        ? '<div class="spinner"></div>'
+        : state === "error"
+        ? `<div class="error-msg">${esc(errMsg)}</div>`
+        : `<pre class="json-block">${esc(JSON.stringify(data, null, 2))}</pre>
+           <button class="copy-btn">Copy JSON</button>`;
+    return `
+        <div class="card-header">
+            <span class="card-filename">${esc(filename)}</span>
+            ${badge}
+        </div>
+        <div class="card-body">${body}</div>`;
+}
+
+function attachCopy(container) {
+    const btn = container.querySelector(".copy-btn");
+    if (!btn) return;
+    btn.addEventListener("click", () => {
+        navigator.clipboard.writeText(container.querySelector(".json-block").textContent)
+            .then(() => { btn.textContent = "Copied!"; setTimeout(() => btn.textContent = "Copy JSON", 1500); });
+    });
+}
+
+// ── PDF: load file ───────────────────────────────────────────
+async function loadPdfFile(file) {
+    pdfFilenameEl.textContent = file.name;
+
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+        pdfWrapper.style.display     = "none";
+        pdfPlaceholder.style.display = "flex";
+        pdfPlaceholder.querySelector("span").textContent = `${file.name} — not a PDF`;
+        pdfPageNumEl.textContent = "— / —";
+        btnPdfPrev.disabled = btnPdfNext.disabled = true;
+        return;
+    }
+
+    pdfPlaceholder.style.display = "none";
+    pdfWrapper.style.display     = "block";
+
+    const arrayBuffer = await file.arrayBuffer();
+    pdfDoc            = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    pdfPageCount      = pdfDoc.numPages;
+    pdfPageNum        = 1;
+    updatePdfNavButtons();
+    await renderPage(pdfPageNum);
+}
+
+function clearPdfViewer() {
+    pdfDoc = null; pdfPageNum = 1; pdfPageCount = 0;
+    pdfWrapper.style.display     = "none";
+    pdfPlaceholder.style.display = "flex";
+    pdfPlaceholder.querySelector("span").textContent = "Upload PDFs to preview them here";
+    pdfFilenameEl.textContent = "No file selected";
+    pdfPageNumEl.textContent  = "— / —";
+    btnPdfPrev.disabled = btnPdfNext.disabled = true;
+}
+
+// ── PDF: render page ─────────────────────────────────────────
+function queueRenderPage(num) {
+    pdfRendering ? (pdfPagePending = num) : renderPage(num);
+}
+
+async function renderPage(num) {
+    if (!pdfDoc) return;
+    pdfRendering = true;
+
+    const page      = await pdfDoc.getPage(num);
+    const container = document.getElementById("pdf-viewport");
+    const fitWidth  = container.clientWidth - 24;
+
+    const baseViewport   = page.getViewport({ scale: 1.0 });
+    const scale          = fitWidth / baseViewport.width;
+    const scaledViewport = page.getViewport({ scale });
+
+    const ctx = pdfCanvas.getContext("2d");
+    pdfCanvas.width  = scaledViewport.width;
+    pdfCanvas.height = scaledViewport.height;
+    pdfWrapper.style.width  = scaledViewport.width  + "px";
+    pdfWrapper.style.height = scaledViewport.height + "px";
+
+    await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
+
+    textLayerDiv.innerHTML = "";
+    textLayerDiv.style.width  = scaledViewport.width  + "px";
+    textLayerDiv.style.height = scaledViewport.height + "px";
+
+    const textContent = await page.getTextContent();
+    const renderTask  = pdfjsLib.renderTextLayer({
+        textContent,
+        container: textLayerDiv,
+        viewport: scaledViewport,
+        textDivs: [],
+    });
+    if (renderTask?.promise) await renderTask.promise;
+
+    pdfRendering = false;
+    pdfPageNumEl.textContent = `${num} / ${pdfPageCount}`;
+    updatePdfNavButtons();
+
+    if (currentExtractionData) highlightJsonValues(currentExtractionData);
+
+    if (pdfPagePending !== null) {
+        const pending = pdfPagePending;
+        pdfPagePending = null;
+        renderPage(pending);
+    }
+}
+
+function updatePdfNavButtons() {
+    btnPdfPrev.disabled = pdfPageNum <= 1;
+    btnPdfNext.disabled = pdfPageNum >= pdfPageCount;
+}
+
+// ── Highlights ───────────────────────────────────────────────
+function collectValues(obj, out = new Set()) {
+    if (typeof obj === "string" && obj.trim().length > 1) {
+        out.add(obj.trim().toLowerCase());
+    } else if (typeof obj === "number" && obj !== null) {
+        out.add(String(obj));
+    } else if (Array.isArray(obj)) {
+        obj.forEach(v => collectValues(v, out));
+    } else if (obj && typeof obj === "object") {
+        Object.values(obj).forEach(v => collectValues(v, out));
+    }
+    return out;
+}
+
+function highlightJsonValues(data) {
+    const values = collectValues(data);
+    textLayerDiv.querySelectorAll("span").forEach(span => {
+        span.classList.remove("hl");
+        const text = span.textContent.trim().toLowerCase();
+        if (text.length < 2) return;
+        for (const val of values) {
+            if (val.length >= 2 && (text.includes(val) || val.includes(text))) {
+                span.classList.add("hl");
+                break;
+            }
+        }
+    });
+}
+
+// ── Queue helpers ─────────────────────────────────────────────
+function updateQueueStatus() {
+    if (!fileQueue.length) { queueStatus.textContent = ""; return; }
+    const rem = fileQueue.length - currentIndex;
+    queueStatus.textContent = `File ${Math.min(currentIndex + 1, fileQueue.length)} / ${fileQueue.length}  (${rem} remaining)`;
+    queueStatus.className = rem === 0 ? "status-done" : "status-active";
+}
+
+function setQueueStatus(msg, cls) {
+    queueStatus.textContent = msg;
+    queueStatus.className = cls === "done" ? "status-done" : "status-active";
+}
+
+// ── Download (respects single / one-per-PDF mode) ─────────────
+async function offerDownload() {
+    if (!extractedResults.length) return;
+    const format = formatSelect.value;
+    const mode   = document.querySelector('input[name="outMode"]:checked').value;
+    downloadDiv.innerHTML = "";
+
+    if (mode === "single") {
+        const allData = [];
+        extractedResults.forEach(r => {
+            if (r.state !== "ok" || !r.data) return;
+            Array.isArray(r.data) ? allData.push(...r.data) : allData.push(r.data);
+        });
+        if (!allData.length) return;
+        const deduped = deduplicateRecords(allData);
+        const removed = allData.length - deduped.length;
+        const url = await buildOutputFile(deduped, format);
+        if (url) {
+            const note = removed > 0 ? ` — ${removed} duplicate${removed > 1 ? 's' : ''} removed` : '';
+            downloadDiv.innerHTML = `<a class="download-link" href="${url}" target="_blank">
+                Download all (${format.toUpperCase()})${note}</a>`;
+        }
+    } else {
+        const label = document.createElement("div");
+        label.className = "download-label";
+        label.textContent = "Downloads:";
+        downloadDiv.appendChild(label);
+
+        for (const r of extractedResults) {
+            if (r.state !== "ok" || !r.data) continue;
+            const data   = Array.isArray(r.data) ? r.data : [r.data];
+            const deduped = deduplicateRecords(data);
+            const url    = await buildOutputFile(deduped, format);
+            if (url) {
+                const a = document.createElement("a");
+                a.className  = "download-link download-link-sm";
+                a.href       = url;
+                a.target     = "_blank";
+                a.textContent = r.filename.replace(/\.[^.]+$/, "") + "." + format;
+                downloadDiv.appendChild(a);
+            }
+        }
+    }
+}
+
+// ── Deduplication ─────────────────────────────────────────────
+function deduplicateRecords(records) {
+    const seen = new Set();
+    return records.filter(record => {
+        const r = {};
+        Object.keys(record).forEach(k => { r[k.toLowerCase()] = record[k]; });
+        const key = ['transactionnumber','employeeid','amount','checkdate','detcode']
+            .map(f => String(r[f] ?? '').trim().toLowerCase())
+            .join('\x00');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+async function buildOutputFile(data, format) {
+    const fd = new FormData();
+    fd.append("data",          JSON.stringify(data));
+    fd.append("output_format", format);
+    try {
+        const resp   = await fetch("/build_output", { method: "POST", body: fd });
+        const result = await resp.json();
+        return result.download_url || null;
+    } catch (e) {
+        console.error("build_output failed:", e);
+        return null;
+    }
+}
+
+function esc(str) {
+    return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ── JSON font size control ────────────────────────────────────
+let jsonFontSize = 12;
+const FONT_MIN = 9, FONT_MAX = 28;
+
+function applyJsonFontSize() {
+    document.documentElement.style.setProperty('--json-font-size', jsonFontSize + 'px');
+    document.getElementById('fontSizeLabel').textContent = jsonFontSize + 'px';
+}
+
+document.getElementById('btnFontDec').addEventListener('click', () => {
+    if (jsonFontSize > FONT_MIN) { jsonFontSize--; applyJsonFontSize(); }
+});
+document.getElementById('btnFontInc').addEventListener('click', () => {
+    if (jsonFontSize < FONT_MAX) { jsonFontSize++; applyJsonFontSize(); }
+});
+
+// Initialise viewer state
+clearPdfViewer();
+updateResultNav();
+
+// ── Resizable panels ─────────────────────────────────────────
+(function () {
+    let dragging = false, handle = null, panelA = null, panelB = null;
+    let startX = 0, startA = 0, startB = 0;
+    const MIN = 180;
+
+    document.querySelectorAll('.resize-handle').forEach(h => {
+        h.addEventListener('mousedown', e => {
+            e.preventDefault();
+            dragging = true;
+            handle   = h;
+            panelA   = h.previousElementSibling;
+            panelB   = h.nextElementSibling;
+            startX   = e.clientX;
+            startA   = panelA.getBoundingClientRect().width;
+            startB   = panelB.getBoundingClientRect().width;
+            panelA.style.flex = `0 0 ${startA}px`;
+            panelB.style.flex = `0 0 ${startB}px`;
+            handle.classList.add('active');
+            document.body.style.cursor     = 'col-resize';
+            document.body.style.userSelect = 'none';
+        });
+    });
+
+    document.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        const d    = e.clientX - startX;
+        const newA = Math.max(MIN, startA + d);
+        const newB = Math.max(MIN, startB - d);
+        if (startA + d >= MIN && startB - d >= MIN) {
+            panelA.style.flex = `0 0 ${newA}px`;
+            panelB.style.flex = `0 0 ${newB}px`;
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        handle.classList.remove('active');
+        document.body.style.cursor     = '';
+        document.body.style.userSelect = '';
+        if (pdfDoc && (panelA.classList.contains('pdf-panel') ||
+                       panelB.classList.contains('pdf-panel'))) {
+            setTimeout(() => renderPage(pdfPageNum), 30);
+        }
+        handle = panelA = panelB = null;
+    });
+}());
+
+// ── Vertical resize (output panel height) ─────────────────────
+(function () {
+    const panel  = document.querySelector('.output-panel');
+    const handle = document.getElementById('output-vresize');
+    let dragging = false, startY = 0, startH = 0;
+
+    handle.addEventListener('mousedown', e => {
+        e.preventDefault();
+        startH = panel.getBoundingClientRect().height;
+        panel.style.height    = startH + 'px';
+        panel.style.alignSelf = 'flex-start';
+        startY   = e.clientY;
+        dragging = true;
+        handle.classList.add('active');
+        document.body.style.cursor     = 'row-resize';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        panel.style.height = Math.max(200, startH + (e.clientY - startY)) + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        handle.classList.remove('active');
+        document.body.style.cursor = document.body.style.userSelect = '';
+    });
+}());
+</script>
+
 </body>
 </html>

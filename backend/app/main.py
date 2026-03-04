@@ -5,12 +5,26 @@ from typing import List
 from pathlib import Path
 import os
 import asyncio
+import io
+import json
+import pdfplumber
 
 from .ai_extractor import extract_data
 from .file_service import create_output_file
 from .config import OUTPUT_DIR
 
 app = FastAPI(title="AI Data Entry Agent")
+
+def extract_text_from_bytes(content: bytes, filename: str) -> str:
+    if filename.lower().endswith(".pdf"):
+        text = ""
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+        return text.strip()
+    return content.decode(errors="ignore")
 
 # ───────────────────────────────
 # PATH SETUP
@@ -47,7 +61,7 @@ semaphore = asyncio.Semaphore(5)
 
 async def limited_extract(text: str, prompt: str):
     async with semaphore:
-        return await extract_data(text, prompt)
+        return await asyncio.to_thread(extract_data, text, prompt)
 
 # ───────────────────────────────
 # PROCESS FILES
@@ -64,7 +78,7 @@ async def process_files(
     # Read files and prepare async tasks
     for file in files:
         content = await file.read()
-        text = content.decode(errors="ignore")
+        text = extract_text_from_bytes(content, file.filename)
         tasks.append(limited_extract(text, prompt))
 
     # Run AI calls concurrently
@@ -104,3 +118,48 @@ def download_file(filename: str):
         return {"error": "File not found"}
 
     return FileResponse(file_path, filename=filename)
+
+# ───────────────────────────────
+# EXTRACT SINGLE FILE → JSON
+# ───────────────────────────────
+
+@app.post("/extract")
+async def extract_single(
+    file: UploadFile = File(...),
+    prompt: str = Form(...)
+):
+    content = await file.read()
+    text = extract_text_from_bytes(content, file.filename)
+    result = await limited_extract(text, prompt)
+
+    if result is None:
+        return {"error": "Extraction failed", "filename": file.filename}
+
+    return {"filename": file.filename, "data": result}
+
+# ───────────────────────────────
+# BUILD OUTPUT FROM EXTRACTED JSON
+# ───────────────────────────────
+
+@app.post("/build_output")
+async def build_output(
+    data: str = Form(...),
+    output_format: str = Form("csv")
+):
+    try:
+        parsed = json.loads(data)
+    except Exception:
+        return {"error": "Invalid JSON data"}
+
+    if isinstance(parsed, dict):
+        all_data = [parsed]
+    elif isinstance(parsed, list):
+        all_data = parsed
+    else:
+        return {"error": "Unexpected data shape"}
+
+    filename, _ = create_output_file(all_data, output_format)
+    if not filename:
+        return {"error": "Could not create output file"}
+
+    return {"download_url": f"/download/{filename}"}

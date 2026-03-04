@@ -1,16 +1,15 @@
 import json
-import os
-from openai import AsyncOpenAI
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI()
 
-async def extract_data(file_content: str, user_prompt: str):
+def extract_data(file_content: str, user_prompt: str):
 
     try:
-        response = await client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-5-nano",
             messages=[
                 {
