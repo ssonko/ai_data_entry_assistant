@@ -5,7 +5,7 @@ from .config import OUTPUT_DIR
 
 def create_output_file(data: list, output_format: str):
 
-    df = pd.DataFrame(data)
+    df = pd.json_normalize(data)
     file_id = str(uuid.uuid4())
 
     if output_format == "csv":
